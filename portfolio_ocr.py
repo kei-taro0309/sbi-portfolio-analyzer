@@ -1,45 +1,41 @@
-# portfolio_ocr.py — SBI証券スクリーンショット OCR解析エンジン
-# easyocr (primary) / pytesseract (fallback) / 手動入力 (ultimate fallback)
+# portfolio_ocr.py v2 — SBI証券スクリーンショット Column-aware OCRパーサー
+#
+# SBIレイアウト構造（1銘柄 = 2〜3行）:
+#   行A: [銘柄名]           [現在値]      [評価損益円]
+#   行B: [コード 建玉/特定]  [平均単価]    [評価損益率%]
+#   行C: [6ヶ月] など（任意）
+#
+# 旧実装の問題: コード発見後に「次の行」から価格を探していた（逆）
+# 新実装の方針: コード行(B)を発見し「前の行(A)」をルックバックで価格取得
 
 import re
 import os
-from pathlib import Path
 
-# ── OCRバックエンド選択 ──────────────────────────────────────
+# ── OCRバックエンド ──────────────────────────────────────────────
 
 def _try_easyocr(image_path: str):
-    """easyocr で画像からテキストブロック（text, bbox, conf）を返す"""
     import easyocr
     reader = easyocr.Reader(['ja', 'en'], gpu=False, verbose=False)
-    results = reader.readtext(image_path)
-    # results: [(bbox, text, conf), ...]
-    return [(r[1], r[0], r[2]) for r in results]
+    return [(r[1], r[0], r[2]) for r in reader.readtext(image_path)]
 
 
 def _try_tesseract(image_path: str):
-    """pytesseract で画像からテキストデータを返す"""
     import pytesseract
     from PIL import Image
     img = Image.open(image_path)
-    data = pytesseract.image_to_data(
-        img, lang='jpn', output_type=pytesseract.Output.DICT)
+    data = pytesseract.image_to_data(img, lang='jpn', output_type=pytesseract.Output.DICT)
     blocks = []
     for i, text in enumerate(data['text']):
         if text.strip():
             x, y = data['left'][i], data['top'][i]
             w, h = data['width'][i], data['height'][i]
             bbox = [[x, y], [x+w, y], [x+w, y+h], [x, y+h]]
-            conf = data['conf'][i] / 100.0
-            blocks.append((text.strip(), bbox, conf))
+            blocks.append((text.strip(), bbox, data['conf'][i] / 100.0))
     return blocks
 
 
 def ocr_image(image_path: str):
-    """
-    画像をOCRして (text, bbox, conf) リストを返す。
-    easyocr → pytesseract の順で試みる。
-    """
-    for fn, name in [(_try_easyocr, "easyocr"), (_try_tesseract, "pytesseract")]:
+    for fn, name in [(_try_easyocr, 'easyocr'), (_try_tesseract, 'pytesseract')]:
         try:
             blocks = fn(image_path)
             if blocks:
@@ -52,161 +48,200 @@ def ocr_image(image_path: str):
     return []
 
 
-# ── パターン定義 ─────────────────────────────────────────────
-
-_RE_PRICE    = re.compile(r'(\d{1,5}[,，]\d{3}(?:\.\d{1,2})?|\d{2,6}(?:\.\d{1,2})?)(?:円)?')
-_RE_PCT      = re.compile(r'([+\-−]?\d{1,3}(?:\.\d{1,2})?)(?:%|％)')
-_RE_CODE     = re.compile(r'\b(\d{4})\b')
-_RE_PNL_YEN  = re.compile(r'([+\-−]?\d{1,3}(?:[,，]\d{3})*(?:\.\d{1,2})?)(?:円)?')
-
-
-def _clean_num(s: str) -> float:
-    """'1,234.56' や '+6,500' → float"""
-    s = s.replace(',', '').replace('，', '').replace('−', '-').replace('＋', '+')
-    try:
-        return float(s)
-    except ValueError:
-        return 0.0
-
-
-def _bbox_y_center(bbox):
-    """bboxの中心y座標を返す"""
-    ys = [pt[1] for pt in bbox]
-    return sum(ys) / len(ys)
-
-
-def _bbox_x_center(bbox):
-    """bboxの中心x座標を返す"""
-    xs = [pt[0] for pt in bbox]
-    return sum(xs) / len(xs)
-
-
-# ── SBIスクリーンショット専用パーサー ────────────────────────
+# ── SBIスクリーンショット専用パーサー v2 ─────────────────────────
 
 class SBIPortfolioOCR:
     """
-    SBI証券モバイルアプリ「口座管理→信用建玉」スクリーンショットを解析し、
-    ポジションリストを返す。
+    Column-aware SBI証券「信用建玉」スクリーンショットパーサー。
+
+    カラム分類は画像幅に対する相対比率で決定:
+      L列 (x < 38%) : 銘柄名・証券コード
+      M列 (38-65%)  : 現在値・平均単価
+      R列 (x > 65%) : 評価損益円・評価損益率
+
+    アルゴリズム:
+      1. 各ブロックをL/M/Rカラムに分類
+      2. y座標でグループ化して行を形成
+      3. L列に4桁コードが含まれる行 = コード行(B)
+      4. コード行から最大3行前をルックバック → 現在値・評価損益円を取得
+      5. コード行自身から平均単価・評価損益率を取得
     """
 
-    # 既知銘柄コードマッピング（OCRが読み誤った際の補完用）
     KNOWN_NAMES = {
-        "1605": "INPEX",
-        "1662": "石油資源開発",
-        "2782": "セリア",
-        "3901": "アゼアス",
-        "4245": "ダイキアクシス",
-        "4550": "住友ファーマ",
-        "3983": "モリテック",
-        "9602": "東宝",
-        "9876": "コックス",
+        '1605': 'INPEX',
+        '1662': '石油資源開発',
+        '2782': 'セリア',
+        '3901': 'アゼアス',
+        '4245': 'ダイキアクシス',
+        '4550': '住友ファーマ',
+        '4506': '住友ファーマ',
+        '3983': 'モリテック',
+        '9602': '東宝',
+        '9876': 'コックス',
     }
 
-    def parse_screenshot(self, image_path: str) -> list[dict]:
-        """
-        スクリーンショットを解析してポジションリストを返す。
-        各ポジション dict のキー:
-          code, name, current_price, avg_cost, pnl_yen, pnl_pct
-        """
+    # カラム境界（画像幅比）
+    LEFT_MAX  = 0.38   # L列上限
+    RIGHT_MIN = 0.65   # R列下限
+
+    _RE_CODE  = re.compile(r'\b(\d{4})\b')
+    _RE_PRICE = re.compile(r'(\d[\d,，]*(?:\.\d{1,2})?)(?:円|¥)?')
+    _RE_PCT   = re.compile(r'([+\-−]?\d{1,3}(?:\.\d{1,2})?)(?:%|％)')
+
+    @staticmethod
+    def _sf(s: str):
+        """文字列 → float。変換失敗時は None"""
+        try:
+            return float(str(s)
+                         .replace(',', '').replace('，', '')
+                         .replace('−', '-').replace('＋', '+')
+                         .replace('±', ''))
+        except Exception:
+            return None
+
+    # ── 公開API ──────────────────────────────────────────────────
+
+    def parse_screenshot(self, image_path: str) -> list:
         blocks = ocr_image(image_path)
         if not blocks:
             print("[OCR] テキスト検出なし → 手動入力モードへ")
             return self._manual_input()
 
-        return self._parse_blocks(blocks)
+        try:
+            from PIL import Image
+            with Image.open(image_path) as img:
+                img_w, img_h = img.size
+        except Exception:
+            img_w = img_h = 1000
 
-    def _parse_blocks(self, blocks: list) -> list[dict]:
-        """
-        bboxを使ってブロックをy座標でクラスタリングし、行ごとにパース。
-        """
-        # y座標でソート
-        sorted_blocks = sorted(blocks, key=lambda b: _bbox_y_center(b[1]))
+        return self._parse_v2(blocks, img_w, img_h)
 
-        # y座標が近いブロックを同一行にグループ化（±20px以内）
-        rows = []
-        current_row = []
-        current_y = None
-        for text, bbox, conf in sorted_blocks:
-            y = _bbox_y_center(bbox)
-            if current_y is None or abs(y - current_y) <= 25:
-                current_row.append((text, bbox, conf))
-                current_y = y if current_y is None else (current_y + y) / 2
+    # ── 内部処理 ─────────────────────────────────────────────────
+
+    def _parse_v2(self, blocks: list, img_w: int, img_h: int) -> list:
+
+        # 1. カラム分類 ────────────────────────────────────────────
+        enriched = []
+        for text, bbox, conf in blocks:
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            xn = sum(xs) / 4 / img_w   # 正規化 x
+            ya = sum(ys) / 4            # 絶対 y（行グループ用）
+            col = ('L' if xn < self.LEFT_MAX
+                   else 'R' if xn > self.RIGHT_MIN
+                   else 'M')
+            enriched.append({'t': text.strip(), 'xn': xn, 'ya': ya, 'col': col})
+
+        enriched.sort(key=lambda b: (b['ya'], b['xn']))
+
+        # 2. 行グループ化（y 方向 ±2.5% of img_h） ───────────────
+        tol = max(img_h * 0.025, 8)
+        rows, cur, cy = [], [], None
+        for b in enriched:
+            if cy is None or abs(b['ya'] - cy) <= tol:
+                cur.append(b)
+                cy = b['ya'] if cy is None else (cy + b['ya']) / 2
             else:
-                if current_row:
-                    rows.append(current_row)
-                current_row = [(text, bbox, conf)]
-                current_y = y
-        if current_row:
-            rows.append(current_row)
+                rows.append(cur)
+                cur, cy = [b], b['ya']
+        if cur:
+            rows.append(cur)
 
-        # 行からポジション情報を抽出
+        # 3. L/M/R テキストに集約 ──────────────────────────────────
+        def lmr(row):
+            L = ' '.join(b['t'] for b in row if b['col'] == 'L')
+            M = ' '.join(b['t'] for b in row if b['col'] == 'M')
+            R = ' '.join(b['t'] for b in row if b['col'] == 'R')
+            return L.strip(), M.strip(), R.strip()
+
+        collapsed = [lmr(r) for r in rows]
+
+        # 4. ヘルパー関数 ──────────────────────────────────────────
+        def get_code(txt):
+            m = self._RE_CODE.search(txt)
+            return m.group(1) if m and 1000 <= int(m.group(1)) <= 9999 else None
+
+        def get_prices(txt):
+            return [v for p in self._RE_PRICE.findall(txt)
+                    for v in [self._sf(p)] if v and v > 50]
+
+        def get_pct(txt):
+            for p in self._RE_PCT.findall(txt):
+                v = self._sf(p)
+                if v is not None and abs(v) < 100:
+                    return v
+            return None
+
+        def get_yen(txt):
+            # 符号付き金額 (+6,189 / -10,677)
+            m = re.search(r'([+\-−±])\s*([\d,，]+(?:\.\d+)?)', txt)
+            if m:
+                sign = -1 if m.group(1) in ('-', '−') else 1
+                v = self._sf(m.group(2))
+                return sign * v if v is not None else None
+            # フォールバック: 最大金額に符号推定
+            prices = get_prices(txt)
+            if not prices:
+                return None
+            neg = bool(re.search(r'[-−]', txt))
+            return (-1 if neg else 1) * max(abs(p) for p in prices)
+
+        # 5. コード行 → ルックバックでペアリング ──────────────────
         positions = []
-        pending = {}
-
-        for row in rows:
-            row_text = ' '.join(t for t, _, _ in sorted(row, key=lambda b: _bbox_x_center(b[1])))
-            row_text = row_text.strip()
-
-            # 4桁コードを探す
-            code_match = _RE_CODE.search(row_text)
-            if code_match:
-                code = code_match.group(1)
-                if 1000 <= int(code) <= 9999:
-                    if pending:
-                        positions.append(pending)
-                    name = self.KNOWN_NAMES.get(code, row_text.split()[0][:10])
-                    pending = {"code": code, "name": name,
-                               "current_price": None, "avg_cost": None,
-                               "pnl_yen": None, "pnl_pct": None}
-                    continue
-
-            if not pending:
+        for i, (L, M, R) in enumerate(collapsed):
+            code = get_code(L)
+            if not code:
                 continue
 
-            # 価格行パース（現在値 / 平均単価）
-            prices = _RE_PRICE.findall(row_text)
-            if prices and pending["current_price"] is None:
-                prices_f = [_clean_num(p) for p in prices if _clean_num(p) > 0]
-                if len(prices_f) >= 2:
-                    pending["current_price"] = prices_f[0]
-                    pending["avg_cost"]       = prices_f[1]
-                elif len(prices_f) == 1 and prices_f[0] > 100:
-                    pending["current_price"]  = prices_f[0]
+            name = self.KNOWN_NAMES.get(code, code)
+            cur_price = avg_price = pnl_yen = None
+
+            # コード行の直前（最大3行前）に現在値が載っている行を探す
+            for j in range(i - 1, max(i - 4, -1), -1):
+                pL, pM, pR = collapsed[j]
+                prices = get_prices(pM)
+                if prices:
+                    cur_price = prices[0]
+                    pnl_yen   = get_yen(pR)
+                    if code not in self.KNOWN_NAMES and pL.strip():
+                        name = pL.strip()[:20]
+                    break
+
+            # このコード行から平均単価・損益率を取得
+            avg_candidates = get_prices(M)
+            if avg_candidates:
+                avg_price = avg_candidates[0]
+            pnl_pct = get_pct(R)
+
+            if cur_price is None or avg_price is None:
                 continue
 
-            # 損益行パース（評価損益円 / 評価損益率%）
-            pct_matches = _RE_PCT.findall(row_text)
-            if pct_matches and pending["pnl_pct"] is None:
-                pct = _clean_num(pct_matches[-1])
-                pending["pnl_pct"] = pct
-                # yen amount
-                yen_matches = _RE_PNL_YEN.findall(row_text)
-                if yen_matches:
-                    for ym in yen_matches:
-                        v = _clean_num(ym)
-                        if abs(v) > 10:
-                            pending["pnl_yen"] = v
-                            break
+            if pnl_pct is None:
+                pnl_pct = (cur_price - avg_price) / avg_price * 100
 
-        if pending and pending.get("code"):
-            positions.append(pending)
+            # pnl_yen の符号を pnl_pct で補正（OCRが符号を落とすケース対策）
+            if pnl_yen is not None:
+                if pnl_pct < 0 and pnl_yen > 0:
+                    pnl_yen = -pnl_yen
+                elif pnl_pct > 0 and pnl_yen < 0:
+                    pnl_yen = -pnl_yen
 
-        # コードだけあって価格が取れなかった行を除外
-        valid = [p for p in positions if p.get("current_price") and p.get("avg_cost")]
-        print(f"[OCR] {len(valid)} ポジション検出")
+            positions.append({
+                'code':          code,
+                'name':          name,
+                'current_price': cur_price,
+                'avg_cost':      avg_price,
+                'pnl_pct':       round(pnl_pct, 2),
+                'pnl_yen':       round(pnl_yen) if pnl_yen is not None else None,
+            })
 
-        # avg_cost から pnl_pct を補完
-        for p in valid:
-            if p["pnl_pct"] is None and p["current_price"] and p["avg_cost"]:
-                p["pnl_pct"] = (p["current_price"] - p["avg_cost"]) / p["avg_cost"] * 100
-
-        return valid
+        print(f"[OCR] {len(positions)} ポジション検出")
+        return positions
 
     @staticmethod
-    def _manual_input() -> list[dict]:
-        """OCR失敗時の手動入力インターフェース"""
+    def _manual_input() -> list:
         print("\n=== 手動入力モード ===")
-        print("ポジションを1件ずつ入力してください。終了: コードに 'q' を入力")
+        print("ポジションを1件ずつ入力（終了: コードに 'q'）")
         positions = []
         while True:
             code = input("証券コード(4桁) or 'q': ").strip()
@@ -215,18 +250,18 @@ class SBIPortfolioOCR:
             if not (code.isdigit() and len(code) == 4):
                 print("4桁の数字を入力してください")
                 continue
-            name      = input(f"  銘柄名: ").strip()
+            name = input(f"  銘柄名: ").strip()
             try:
-                cur  = float(input(f"  現在値(円): ").replace(',', ''))
-                avg  = float(input(f"  平均単価(円): ").replace(',', ''))
+                cur = float(input(f"  現在値(円): ").replace(',', ''))
+                avg = float(input(f"  平均単価(円): ").replace(',', ''))
             except ValueError:
                 print("  数値エラー、スキップ")
                 continue
             pnl_pct = (cur - avg) / avg * 100
             positions.append({
-                "code": code, "name": name,
-                "current_price": cur, "avg_cost": avg,
-                "pnl_yen": None, "pnl_pct": round(pnl_pct, 2),
+                'code': code, 'name': name,
+                'current_price': cur, 'avg_cost': avg,
+                'pnl_yen': None, 'pnl_pct': round(pnl_pct, 2),
             })
             print(f"  → 追加: {name}({code}) 損益率{pnl_pct:+.2f}%")
         return positions
@@ -243,6 +278,8 @@ if __name__ == "__main__":
     positions = ocr.parse_screenshot(sys.argv[1])
     print("\n=== 検出ポジション ===")
     for p in positions:
+        cur = p['current_price']
+        avg = p['avg_cost']
+        pnl = p['pnl_pct']
         print(f"  {p['code']} {p['name']:12s}  "
-              f"現在値{p['current_price']:,.0f}  平均{p['avg_cost']:,.2f}  "
-              f"損益率{p['pnl_pct']:+.2f}%")
+              f"現在値{cur:>8,.1f}  平均{avg:>9,.2f}  損益率{pnl:+.2f}%")
