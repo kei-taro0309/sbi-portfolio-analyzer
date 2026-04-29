@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+credentials.json
+*.log
+レポート/
+.scan_done_*.txt
+signal_log.jsonl
+ev_table.json
