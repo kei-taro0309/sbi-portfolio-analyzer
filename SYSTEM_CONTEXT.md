@@ -181,6 +181,7 @@ def fetch_ohlcv(code, days=200):
 | yfinance MultiIndex | `df['Close'].tolist()`が新版で失敗 | `_col()`でsqueeze().dropna().tolist() |
 | データ不足 | days=130で取引日90日に足りない | days=200、最低閾値80に変更 |
 | OCR価格の取り違え | コード後の行から価格を探す（逆） | Column-aware + ルックバック方式に全面刷新 |
+| OCR行マージ誤動作 | ROW_TOL=2.5%(21px)≥行間隔20px→行AとBが合体し、ヘッダー行の-61,926を現在値と誤認 | ROW_TOL=0.012(10px)に修正。test_ocr.pyで9銘柄100%確認済み |
 | 損益符号の欠落 | OCRが`-`を認識しない場合あり | pnl_pctの符号でpnl_yenを補正 |
 | 4550 ticker not found | 住友ファーマは4506が正しいコード | SECTOR_MAPに両方登録 |
 | CP932 UnicodeError | Windows端末が絵文字を出力できない | `.encode('ascii','replace').decode()` |
