@@ -134,8 +134,10 @@ class SBIPortfolioOCR:
 
         enriched.sort(key=lambda b: (b['ya'], b['xn']))
 
-        # 2. 行グループ化（y 方向 ±2.5% of img_h） ───────────────
-        tol = max(img_h * 0.025, 8)
+        # 2. 行グループ化（y 方向 ±1.2% of img_h）
+        # SBIの行間隔~20px・行内ばらつき~5px → 10px前後が適切
+        # 2.5%だと行AとBがマージされ価格が取れなくなる
+        tol = max(img_h * 0.012, 5)
         rows, cur, cy = [], [], None
         for b in enriched:
             if cy is None or abs(b['ya'] - cy) <= tol:
